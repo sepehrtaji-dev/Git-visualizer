@@ -5,27 +5,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# ── Dependencies ──────────────────────────────────────────────────────────────
+# ── FTXUI (auto-downloaded, no install needed) ────────────────────────────────
 include(FetchContent)
-
-# FTXUI
 FetchContent_Declare(ftxui
   GIT_REPOSITORY https://github.com/ArthurSonzogni/FTXUI
   GIT_TAG        v5.0.0
 )
 FetchContent_MakeAvailable(ftxui)
-
-# libgit2 — works with both vcpkg (Windows) and pkg-config (Linux/macOS)
-if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
-    # Windows / vcpkg path
-    find_package(libgit2 CONFIG REQUIRED)
-    set(LIBGIT2_TARGET libgit2::libgit2)
-else()
-    # Linux / macOS path
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(LIBGIT2 REQUIRED libgit2)
-    set(LIBGIT2_TARGET ${LIBGIT2_LIBRARIES})
-endif()
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 set(SOURCES
@@ -39,13 +25,9 @@ set(SOURCES
 
 add_executable(gitviz ${SOURCES})
 
-target_include_directories(gitviz PRIVATE
-    src/
-    $<$<NOT:$<BOOL:${CMAKE_TOOLCHAIN_FILE}>>:${LIBGIT2_INCLUDE_DIRS}>
-)
+target_include_directories(gitviz PRIVATE src/)
 
 target_link_libraries(gitviz PRIVATE
-    ${LIBGIT2_TARGET}
     ftxui::screen
     ftxui::dom
     ftxui::component
