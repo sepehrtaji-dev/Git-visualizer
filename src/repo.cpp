@@ -1,195 +1,152 @@
 #include "repo.hpp"
-#include <git2.h>
 #include <stdexcept>
 #include <sstream>
-#include <iomanip>
-#include <ctime>
-#include <unordered_map>
-#include <unordered_set>
+#include <array>
+#include <cstdio>
+#include <algorithm>
 
-// ── RAII helpers ──────────────────────────────────────────────────────────────
-static void check(int err, const char* ctx) {
-    if (err < 0) {
-        const git_error* e = git_error_last();
-        throw std::runtime_error(std::string(ctx) + ": " +
-                                 (e ? e->message : "unknown error"));
-    }
+#ifdef _WIN32
+  #define POPEN  _popen
+  #define PCLOSE _pclose
+#else
+  #define POPEN  popen
+  #define PCLOSE pclose
+#endif
+
+// ── run() — execute a git command and return stdout ───────────────────────────
+std::string Repo::run(const std::string& cmd) const {
+    // cd into repo path first
+    std::string full = "git -C \"" + path_ + "\" " + cmd + " 2>nul";
+#ifndef _WIN32
+    full = "git -C \"" + path_ + "\" " + cmd + " 2>/dev/null";
+#endif
+
+    FILE* pipe = POPEN(full.c_str(), "r");
+    if (!pipe) return "";
+
+    std::string result;
+    std::array<char, 512> buf;
+    while (fgets(buf.data(), buf.size(), pipe))
+        result += buf.data();
+
+    PCLOSE(pipe);
+    return result;
 }
 
-// ── Ctor / Dtor ───────────────────────────────────────────────────────────────
+// ── Ctor ──────────────────────────────────────────────────────────────────────
 Repo::Repo(const std::string& path) : path_(path) {
-    git_libgit2_init();
-    check(git_repository_open_ext(&repo_, path.c_str(), 0, nullptr),
-          "open repository");
+    std::string check = run("rev-parse --git-dir");
+    if (check.empty())
+        throw std::runtime_error("Not a git repository: " + path);
 }
 
-Repo::~Repo() {
-    if (repo_) git_repository_free(repo_);
-    git_libgit2_shutdown();
+// ── split helper ──────────────────────────────────────────────────────────────
+static std::vector<std::string> split(const std::string& s, char delim) {
+    std::vector<std::string> parts;
+    std::istringstream ss(s);
+    std::string token;
+    while (std::getline(ss, token, delim))
+        parts.push_back(token);
+    return parts;
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-std::string Repo::format_time(git_time_t t, int offset) const {
-    time_t tt = static_cast<time_t>(t + offset * 60);
-    struct tm tm_info;
-    gmtime_r(&tt, &tm_info);
-    char buf[32];
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tm_info);
-    return buf;
-}
-
-Commit Repo::make_commit(git_commit* c) const {
-    Commit commit;
-
-    // OID
-    const git_oid* oid = git_commit_id(c);
-    char sha[GIT_OID_HEXSZ + 1];
-    git_oid_tostr(sha, sizeof(sha), oid);
-    commit.oid       = sha;
-    commit.short_oid = commit.oid.substr(0, 7);
-
-    // Message (first line only)
-    const char* msg = git_commit_message(c);
-    if (msg) {
-        std::string full(msg);
-        auto nl = full.find('\n');
-        commit.message = (nl != std::string::npos) ? full.substr(0, nl) : full;
-    }
-
-    // Author
-    const git_signature* sig = git_commit_author(c);
-    if (sig) {
-        commit.author = sig->name  ? sig->name  : "";
-        commit.email  = sig->email ? sig->email : "";
-        commit.date   = format_time(sig->when.time, sig->when.offset);
-    }
-
-    // Parents
-    unsigned int pcount = git_commit_parentcount(c);
-    for (unsigned int i = 0; i < pcount; ++i) {
-        const git_oid* pid = git_commit_parent_id(c, i);
-        char psha[GIT_OID_HEXSZ + 1];
-        git_oid_tostr(psha, sizeof(psha), pid);
-        commit.parent_oids.push_back(psha);
-    }
-
-    return commit;
+static std::string trim(const std::string& s) {
+    size_t a = s.find_first_not_of(" \t\r\n");
+    size_t b = s.find_last_not_of(" \t\r\n");
+    return (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
 }
 
 // ── log() ─────────────────────────────────────────────────────────────────────
 std::vector<Commit> Repo::log(int max_commits) const {
-    // Build ref → oid map for decorations
-    std::unordered_map<std::string, std::vector<std::string>> ref_map;
-
-    git_reference_iterator* ref_iter = nullptr;
-    if (git_reference_iterator_new(&ref_iter, repo_) == 0) {
-        git_reference* ref = nullptr;
-        while (git_reference_next(&ref, ref_iter) == 0) {
-            git_reference* resolved = nullptr;
-            if (git_reference_resolve(&resolved, ref) == 0) {
-                const git_oid* oid = git_reference_target(resolved);
-                if (oid) {
-                    char sha[GIT_OID_HEXSZ + 1];
-                    git_oid_tostr(sha, sizeof(sha), oid);
-                    std::string name = git_reference_shorthand(ref);
-                    ref_map[sha].push_back(name);
-                }
-                git_reference_free(resolved);
-            }
-            git_reference_free(ref);
-        }
-        git_reference_iterator_free(ref_iter);
-    }
-
-    // Walk commits
-    git_revwalk* walker = nullptr;
-    check(git_revwalk_new(&walker, repo_), "revwalk_new");
-    git_revwalk_sorting(walker, GIT_SORT_TOPOLOGICAL | GIT_SORT_TIME);
-    git_revwalk_push_glob(walker, "refs/heads/*");
-    git_revwalk_push_glob(walker, "refs/remotes/*");
+    // Format: OID|PARENTS|AUTHOR|EMAIL|DATE|REFS|MESSAGE
+    std::string fmt = "--pretty=format:%H|%P|%an|%ae|%ai|%D|%s";
+    std::string out = run("log --all " + fmt +
+                          " -n " + std::to_string(max_commits));
 
     std::vector<Commit> commits;
-    git_oid oid;
-    int count = 0;
+    auto lines = split(out, '\n');
 
-    while (git_revwalk_next(&oid, walker) == 0 && count < max_commits) {
-        git_commit* c = nullptr;
-        if (git_commit_lookup(&c, repo_, &oid) != 0) continue;
+    for (auto& line : lines) {
+        if (trim(line).empty()) continue;
+        auto parts = split(line, '|');
+        if (parts.size() < 7) continue;
 
-        Commit commit = make_commit(c);
+        Commit c;
+        c.oid       = trim(parts[0]);
+        c.short_oid = c.oid.size() >= 7 ? c.oid.substr(0, 7) : c.oid;
+        c.author    = trim(parts[2]);
+        c.email     = trim(parts[3]);
+        c.date      = trim(parts[4]).substr(0, 16); // "2024-01-15 10:30"
+        c.message   = trim(parts[6]);
 
-        // Attach ref decorations
-        auto it = ref_map.find(commit.oid);
-        if (it != ref_map.end())
-            commit.refs = it->second;
+        // Parents
+        std::string pstr = trim(parts[1]);
+        if (!pstr.empty()) {
+            for (auto& p : split(pstr, ' '))
+                if (!trim(p).empty()) c.parent_oids.push_back(trim(p));
+        }
 
-        commits.push_back(std::move(commit));
-        git_commit_free(c);
-        ++count;
+        // Refs (branch/tag decorations)
+        std::string refstr = trim(parts[5]);
+        if (!refstr.empty()) {
+            for (auto& r : split(refstr, ',')) {
+                std::string ref = trim(r);
+                // Strip "HEAD -> " prefix
+                if (ref.substr(0, 7) == "HEAD -> ")
+                    ref = ref.substr(7);
+                if (!ref.empty() && ref != "HEAD")
+                    c.refs.push_back(ref);
+            }
+        }
+
+        commits.push_back(std::move(c));
     }
-
-    git_revwalk_free(walker);
     return commits;
 }
 
 // ── diff_commit() ─────────────────────────────────────────────────────────────
-std::vector<FileDiff> Repo::diff_commit(const std::string& oid_str) const {
-    git_oid oid;
-    check(git_oid_fromstr(&oid, oid_str.c_str()), "oid_fromstr");
+std::vector<FileDiff> Repo::diff_commit(const std::string& oid) const {
+    // Get list of changed files with stats
+    std::string stats = run("show --stat --format= " + oid);
+    // Get full patch
+    std::string patch = run("show --format= -p " + oid);
 
-    git_commit* commit = nullptr;
-    check(git_commit_lookup(&commit, repo_, &oid), "commit_lookup");
-
-    git_tree* new_tree = nullptr;
-    check(git_commit_tree(&new_tree, commit), "commit_tree");
-
-    git_diff* diff = nullptr;
-
-    if (git_commit_parentcount(commit) == 0) {
-        // Initial commit — diff against empty tree
-        check(git_diff_tree_to_tree(&diff, repo_, nullptr, new_tree, nullptr),
-              "diff_tree_to_tree");
-    } else {
-        git_commit* parent = nullptr;
-        check(git_commit_parent(&parent, commit, 0), "commit_parent");
-        git_tree* old_tree = nullptr;
-        check(git_commit_tree(&old_tree, parent), "parent_tree");
-        check(git_diff_tree_to_tree(&diff, repo_, old_tree, new_tree, nullptr),
-              "diff_tree_to_tree");
-        git_tree_free(old_tree);
-        git_commit_free(parent);
-    }
-
-    // Collect stats per file
     std::vector<FileDiff> results;
-    size_t ndeltas = git_diff_num_deltas(diff);
 
-    for (size_t i = 0; i < ndeltas; ++i) {
-        const git_diff_delta* delta = git_diff_get_delta(diff, i);
-        FileDiff fd;
-        fd.path = delta->new_file.path;
+    // Parse patch into per-file sections
+    std::istringstream ss(patch);
+    std::string line;
+    FileDiff current;
+    bool in_file = false;
 
-        git_patch* patch = nullptr;
-        if (git_patch_from_diff(&patch, diff, i) == 0) {
-            size_t adds = 0, dels = 0;
-            git_patch_line_stats(nullptr, &adds, &dels, patch);
-            fd.additions = static_cast<int>(adds);
-            fd.deletions = static_cast<int>(dels);
-
-            // Get patch text
-            git_buf buf = GIT_BUF_INIT;
-            if (git_patch_to_buf(&buf, patch) == 0) {
-                fd.patch = std::string(buf.ptr, buf.size);
-                git_buf_dispose(&buf);
-            }
-            git_patch_free(patch);
+    auto flush = [&]() {
+        if (in_file && !current.path.empty()) {
+            results.push_back(current);
+            current = FileDiff{};
         }
-        results.push_back(std::move(fd));
-    }
+    };
 
-    git_diff_free(diff);
-    git_tree_free(new_tree);
-    git_commit_free(commit);
+    while (std::getline(ss, line)) {
+        if (line.substr(0, 11) == "diff --git ") {
+            flush();
+            in_file = true;
+            current.patch += line + "\n";
+            // Extract path: "diff --git a/foo.cpp b/foo.cpp"
+            auto bpos = line.rfind(" b/");
+            if (bpos != std::string::npos)
+                current.path = line.substr(bpos + 3);
+        } else if (in_file) {
+            current.patch += line + "\n";
+            if (!line.empty() && line[0] == '+' &&
+                !(line.size() > 1 && line[1] == '+'))
+                ++current.additions;
+            else if (!line.empty() && line[0] == '-' &&
+                     !(line.size() > 1 && line[1] == '-'))
+                ++current.deletions;
+        }
+    }
+    flush();
+
     return results;
 }
 
@@ -198,91 +155,58 @@ BlameResult Repo::blame(const std::string& filepath) const {
     BlameResult result;
     result.path = filepath;
 
-    // Read file content at HEAD
-    git_reference* head_ref = nullptr;
-    check(git_repository_head(&head_ref, repo_), "repository_head");
-    const git_oid* head_oid = git_reference_target(head_ref);
+    // Porcelain blame: each hunk has header lines then content lines
+    std::string out = run("blame --porcelain \"" + filepath + "\"");
 
-    git_commit* head_commit = nullptr;
-    check(git_commit_lookup(&head_commit, repo_, head_oid), "head_commit");
-    git_tree* tree = nullptr;
-    check(git_commit_tree(&tree, head_commit), "commit_tree");
-
-    git_tree_entry* entry = nullptr;
-    check(git_tree_entry_bypath(&entry, tree, filepath.c_str()), "tree_entry");
-
-    git_blob* blob = nullptr;
-    check(git_blob_lookup(&blob, repo_,
-                          git_tree_entry_id(entry)), "blob_lookup");
-
-    // Split blob into lines
-    const char* raw  = static_cast<const char*>(git_blob_rawcontent(blob));
-    git_object_size_t size = git_blob_rawsize(blob);
-    std::string content(raw, size);
-    std::istringstream ss(content);
+    std::istringstream ss(out);
     std::string line;
-    while (std::getline(ss, line))
-        result.lines.push_back(line);
 
-    git_blob_free(blob);
-    git_tree_entry_free(entry);
-    git_tree_free(tree);
-    git_commit_free(head_commit);
-    git_reference_free(head_ref);
+    BlameHunk current_hunk;
+    bool has_hunk = false;
 
-    // Run blame
-    git_blame* blame = nullptr;
-    check(git_blame_file(&blame, repo_, filepath.c_str(), nullptr),
-          "blame_file");
+    while (std::getline(ss, line)) {
+        if (line.empty()) continue;
 
-    // Expand hunks per line
-    for (size_t lineno = 1; lineno <= result.lines.size(); ++lineno) {
-        const git_blame_hunk* h = git_blame_get_hunk_byline(blame, lineno);
-        if (!h) continue;
-
-        BlameHunk bh;
-        char sha[8] = {};
-        git_oid_tostr(sha, sizeof(sha), &h->final_commit_id);
-        bh.commit_oid     = sha;
-        bh.orig_line      = h->orig_start_line_number;
-        bh.final_line     = lineno;
-        bh.lines_in_hunk  = h->lines_in_hunk;
-
-        if (h->final_signature) {
-            bh.author = h->final_signature->name  ? h->final_signature->name  : "";
-            bh.date   = format_time(h->final_signature->when.time,
-                                    h->final_signature->when.offset);
+        // A porcelain hunk header starts with 40-char SHA
+        if (line.size() >= 40 &&
+            std::all_of(line.begin(), line.begin() + 40, ::isxdigit)) {
+            current_hunk = BlameHunk{};
+            current_hunk.commit_oid = line.substr(0, 7);
+            auto parts = split(line, ' ');
+            if (parts.size() >= 3)
+                current_hunk.final_line = std::stoul(parts[2]);
+            has_hunk = true;
+        } else if (has_hunk && line.substr(0, 7) == "author ") {
+            current_hunk.author = trim(line.substr(7));
+        } else if (has_hunk && line.substr(0, 12) == "author-time ") {
+            // Unix timestamp → date string
+            time_t t = std::stol(trim(line.substr(12)));
+            char buf[16];
+            struct tm* tm_info = gmtime(&t);
+            strftime(buf, sizeof(buf), "%Y-%m-%d", tm_info);
+            current_hunk.date = buf;
+        } else if (has_hunk && !line.empty() && line[0] == '\t') {
+            // Content line (prefixed with tab)
+            result.lines.push_back(line.substr(1));
+            result.hunks.push_back(current_hunk);
+            has_hunk = false;
         }
-        result.hunks.push_back(std::move(bh));
     }
 
-    git_blame_free(blame);
     return result;
 }
 
 // ── branches() ───────────────────────────────────────────────────────────────
 std::vector<std::string> Repo::branches() const {
+    std::string out = run("branch --format=%(refname:short)");
     std::vector<std::string> result;
-    git_branch_iterator* it = nullptr;
-    if (git_branch_iterator_new(&it, repo_, GIT_BRANCH_LOCAL) != 0)
-        return result;
-
-    git_reference* ref = nullptr;
-    git_branch_t type;
-    while (git_branch_next(&ref, &type, it) == 0) {
-        const char* name = nullptr;
-        git_branch_name(&name, ref);
-        if (name) result.push_back(name);
-        git_reference_free(ref);
+    for (auto& b : split(out, '\n')) {
+        std::string t = trim(b);
+        if (!t.empty()) result.push_back(t);
     }
-    git_branch_iterator_free(it);
     return result;
 }
 
 std::string Repo::current_branch() const {
-    git_reference* head = nullptr;
-    if (git_repository_head(&head, repo_) != 0) return "HEAD";
-    std::string name = git_reference_shorthand(head);
-    git_reference_free(head);
-    return name;
+    return trim(run("rev-parse --abbrev-ref HEAD"));
 }
