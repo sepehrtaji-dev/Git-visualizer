@@ -15,9 +15,17 @@ FetchContent_Declare(ftxui
 )
 FetchContent_MakeAvailable(ftxui)
 
-# libgit2 (system install expected: sudo apt install libgit2-dev)
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(LIBGIT2 REQUIRED libgit2)
+# libgit2 — works with both vcpkg (Windows) and pkg-config (Linux/macOS)
+if(DEFINED CMAKE_TOOLCHAIN_FILE AND CMAKE_TOOLCHAIN_FILE MATCHES "vcpkg")
+    # Windows / vcpkg path
+    find_package(libgit2 CONFIG REQUIRED)
+    set(LIBGIT2_TARGET libgit2::libgit2)
+else()
+    # Linux / macOS path
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(LIBGIT2 REQUIRED libgit2)
+    set(LIBGIT2_TARGET ${LIBGIT2_LIBRARIES})
+endif()
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 set(SOURCES
@@ -33,14 +41,17 @@ add_executable(gitviz ${SOURCES})
 
 target_include_directories(gitviz PRIVATE
     src/
-    ${LIBGIT2_INCLUDE_DIRS}
+    $<$<NOT:$<BOOL:${CMAKE_TOOLCHAIN_FILE}>>:${LIBGIT2_INCLUDE_DIRS}>
 )
 
 target_link_libraries(gitviz PRIVATE
-    ${LIBGIT2_LIBRARIES}
+    ${LIBGIT2_TARGET}
     ftxui::screen
     ftxui::dom
     ftxui::component
 )
 
-target_compile_options(gitviz PRIVATE -Wall -Wextra -O2)
+target_compile_options(gitviz PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W4 /O2>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Wall -Wextra -O2>
+)
